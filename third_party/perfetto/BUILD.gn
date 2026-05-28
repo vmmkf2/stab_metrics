@@ -1,0 +1,72 @@
+# third_party/perfetto/BUILD.gn
+#
+# Wraps the Perfetto amalgamated SDK (perfetto.h + perfetto.cc) as a
+# source_set so it can be consumed by pmu_metrics and the host project.
+#
+# ── How to populate the SDK files ────────────────────────────────────────────
+#
+#  Option 1 — Download pre-built amalgam from a Perfetto release:
+#
+#    curl -L https://github.com/google/perfetto/releases/latest/download/\
+#         perfetto-cpp-sdk-src.zip -o /tmp/sdk.zip
+#    unzip /tmp/sdk.zip -d third_party/perfetto/sdk/
+#    # Results in:
+#    #   third_party/perfetto/sdk/perfetto.h
+#    #   third_party/perfetto/sdk/perfetto.cc
+#
+#  Option 2 — Generate from a Perfetto checkout:
+#
+#    cd /path/to/perfetto
+#    tools/gen_amalgamated --output sdk/perfetto
+#    cp sdk/perfetto.{h,cc} <your_project>/third_party/perfetto/sdk/
+#
+#  Option 3 (recommended for in-tree Perfetto) — if your project already
+#  has Perfetto as a submodule / DEPS entry at, say, //third_party/perfetto/src,
+#  just change sdk_dir below and point to the generated amalgam output dir.
+#
+# ── If Perfetto already exists in your host project ──────────────────────────
+#
+#  If the host project already defines a Perfetto GN target, do NOT add this
+#  file.  Instead, override pmu_metrics_perfetto_target in your args.gn:
+#
+#    pmu_metrics_perfetto_target = "//your/existing:perfetto_target"
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Adjust this path if the SDK files live elsewhere in your tree.
+_sdk_dir = "sdk"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# perfetto_sdk  —  the amalgamated SDK compiled as a source_set.
+#
+# source_set (not static_library) is the correct choice here: it avoids
+# double-archiving when the host binary links both pmu_metrics.a and
+# perfetto_sdk directly, and it lets the linker see all symbols in one pass.
+# ─────────────────────────────────────────────────────────────────────────────
+source_set("perfetto_sdk") {
+  sources = [ "$_sdk_dir/perfetto.cc" ]
+
+  public = [ "$_sdk_dir/perfetto.h" ]
+
+  public_configs = [ ":perfetto_sdk_config" ]
+
+  # The amalgam requires C++17 and pthreads.
+  libs = [ "pthread" ]
+}
+
+config("perfetto_sdk_config") {
+  include_dirs = [ _sdk_dir ]
+
+  cflags_cc = [
+    "-std=c++17",
+    # Perfetto's amalgam is large; suppress noise warnings from it.
+    "-Wno-deprecated-declarations",
+    "-Wno-missing-field-initializers",
+  ]
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Placeholder target that prints a helpful error when the SDK files are absent.
+# ─────────────────────────────────────────────────────────────────────────────
+# (GN has no assert-file-exists built-in; the compilation error when
+#  perfetto.cc is missing is self-explanatory enough.)

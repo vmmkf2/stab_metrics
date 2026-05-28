@@ -1,0 +1,111 @@
+# pmu_metrics/BUILD.gn
+#
+# Builds libpmu_metrics as a static_library that contributes a Perfetto
+# DataSource into the host project's existing trace buffer.
+#
+# ── Constraints ──────────────────────────────────────────────────────────────
+#  A) ALWAYS static_library — never shared_library or loadable_module.
+#     A shared build would cause duplicate Perfetto SDK symbol conflicts when
+#     linked into the host binary that already embeds the SDK.
+#
+#  B) The host project owns the Perfetto tracing lifecycle.
+#     This library NEVER calls perfetto::Tracing::Initialize().
+#     It registers "dev.pmu_metrics" as a DataSource during static init
+#     (before main()) so the host's Initialize() call finds it automatically.
+#
+# ── Integration ──────────────────────────────────────────────────────────────
+#  Host BUILD.gn:
+#
+#    deps = [ "//third_party/pmu_metrics" ]          # or wherever you placed it
+#
+#  That's it. The :pmu_metrics target below pulls in the Perfetto dep
+#  transitively via public_deps.
+#
+# ── Perfetto SDK ─────────────────────────────────────────────────────────────
+#  The host project must have a "perfetto" target defined at the GN path
+#  referenced by the variable $pmu_metrics_perfetto_target (default shown in
+#  pmu_metrics.gni).  Typically this is the amalgamated SDK source_set at
+#  //third_party/perfetto:perfetto_sdk  (see third_party/perfetto/BUILD.gn).
+
+import("//build/config/compiler/compiler.gni")    # for is_clang, etc. (optional)
+import("pmu_metrics.gni")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Public config — propagates include path to all dependents.
+# ─────────────────────────────────────────────────────────────────────────────
+config("pmu_metrics_public_config") {
+  include_dirs = [ "include" ]
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Private config — compile flags applied only to library sources.
+# ─────────────────────────────────────────────────────────────────────────────
+config("pmu_metrics_private_config") {
+  include_dirs = [ "src" ]
+
+  cflags_cc = [
+    "-std=c++17",
+    "-Wall",
+    "-Wextra",
+    "-Wpedantic",
+    "-Wno-unused-parameter",
+    "-Wno-deprecated-declarations",   # Perfetto headers may trigger this
+  ]
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# pmu_metrics  — the static library itself.
+#
+# CONSTRAINT A: static_library — NEVER change to shared_library.
+# ─────────────────────────────────────────────────────────────────────────────
+static_library("pmu_metrics") {
+  sources = [
+    "src/pmu_data_source.cc",
+    "src/pmu_data_source.h",      # listed so IDEs and 'gn desc' see it
+    "src/perf_group.cc",
+    "src/perf_group.h",
+    "src/pmu_session.cc",
+    "src/static_registration.cc",
+  ]
+
+  # Public header exposed to dependents.
+  public = [ "include/pmu_metrics/pmu_metrics.h" ]
+
+  public_configs = [ ":pmu_metrics_public_config" ]
+  configs += [ ":pmu_metrics_private_config" ]
+
+  # CONSTRAINT B: Perfetto SDK must come from the host project's existing
+  # target so both sides share the same SDK instance (in-process backend).
+  # public_deps propagates the Perfetto include path to host TUs that
+  # include <perfetto.h> transitively.
+  public_deps = [ pmu_metrics_perfetto_target ]
+
+  # static_registration.cc must survive --gc-sections / LTO dead-code
+  # elimination because its only effect is a side-effecting constructor.
+  # The linker flag below keeps the whole archive when linking the final
+  # binary.  The host should add this library via:
+  #
+  #   ldflags = [ "-Wl,--whole-archive",
+  #               rebase_path(
+  #                 get_label_info("//third_party/pmu_metrics", "lib_output"),
+  #                 root_build_dir),
+  #               "-Wl,--no-whole-archive" ]
+  #
+  # OR (simpler) rely on the alwayslink below — GN passes -whole-archive
+  # automatically for the target that sets it.
+  complete_static_lib = false   # keep false; host controls link order
+
+  # alwayslink = true would work but forces --whole-archive on the entire
+  # lib.  We keep it false to avoid symbol bloat; instead static_registration
+  # uses a volatile dummy reference (see src/static_registration.cc).
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Convenience group so the host can write:
+#   deps = [ "//third_party/pmu_metrics" ]
+# without knowing the internal target name.
+# (Only needed if pmu_metrics lives under a subdirectory of //third_party.)
+# ─────────────────────────────────────────────────────────────────────────────
+group("pmu_metrics_group") {
+  public_deps = [ ":pmu_metrics" ]
+}

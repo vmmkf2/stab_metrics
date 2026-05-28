@@ -1,0 +1,23 @@
+# pmu_metrics/pmu_metrics.gni
+#
+# GN import file — defines variables used by BUILD.gn and available to the
+# host project when it imports this file.
+#
+# The host project MUST set `pmu_metrics_perfetto_target` before (or after)
+# importing, pointing to the GN label of the Perfetto SDK target.
+#
+# Typical host-side usage in the root .gni or args.gn:
+#
+#   import("//third_party/pmu_metrics/pmu_metrics.gni")
+#   pmu_metrics_perfetto_target = "//third_party/perfetto:perfetto_sdk"
+#
+# If the variable is already set when this file is imported it is not
+# overwritten (declare_args only sets defaults for unset variables).
+
+declare_args() {
+  # GN label for the Perfetto SDK target that exposes <perfetto.h>.
+  # The default points to the amalgamated SDK wrapper included in this repo
+  # at third_party/perfetto/BUILD.gn.  Override in your args.gn if Perfetto
+  # lives elsewhere in your tree.
+  pmu_metrics_perfetto_target = "//third_party/perfetto:perfetto_sdk"
+}

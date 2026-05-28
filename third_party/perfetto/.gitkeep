@@ -1,0 +1,3 @@
+# The Perfetto SDK amalgam (sdk/perfetto.h and sdk/perfetto.cc) is NOT
+# committed to this repository.  See third_party/perfetto/BUILD.gn for
+# instructions on how to obtain them.
