@@ -1,111 +1,129 @@
 # pmu_metrics/BUILD.gn
 #
-# Builds libpmu_metrics as a static_library that contributes a Perfetto
-# DataSource into the host project's existing trace buffer.
+# Produces libpmu_metrics.so — shipped to host projects in two variants
+# (base / proprietary).
 #
-# ── Constraints ──────────────────────────────────────────────────────────────
-#  A) ALWAYS static_library — never shared_library or loadable_module.
-#     A shared build would cause duplicate Perfetto SDK symbol conflicts when
-#     linked into the host binary that already embeds the SDK.
+# ── Key constraints ──────────────────────────────────────────────────────────
 #
-#  B) The host project owns the Perfetto tracing lifecycle.
-#     This library NEVER calls perfetto::Tracing::Initialize().
-#     It registers "dev.pmu_metrics" as a DataSource during static init
-#     (before main()) so the host's Initialize() call finds it automatically.
+#  • ZERO Perfetto symbols in the .so.
+#    The .so is compiled with -fvisibility=hidden; only symbols annotated
+#    PMU_METRICS_API (visibility("default")) are exported.
+#    Perfetto lives entirely in the host binary.
 #
-# ── Integration ──────────────────────────────────────────────────────────────
-#  Host BUILD.gn:
+#  • The host wires Perfetto to the library via writer callbacks at
+#    session-creation time.  See include/pmu_metrics/pmu_metrics_host_shim.h
+#    for the ready-made Perfetto DataSource + PmuMetricsShim C++ wrapper that
+#    the host compiles into its own binary.
 #
-#    deps = [ "//third_party/pmu_metrics" ]          # or wherever you placed it
+# ── Host integration (summary) ───────────────────────────────────────────────
 #
-#  That's it. The :pmu_metrics target below pulls in the Perfetto dep
-#  transitively via public_deps.
+#  1. Add to target_server deps:
+#       "//third_party/pmu_metrics:pmu_metrics_shim"   # Perfetto DataSource
+#
+#  2. In exactly ONE host .cc:
+#       #define PMU_METRICS_DEFINE_DATA_SOURCE
+#       #include "pmu_metrics/pmu_metrics_host_shim.h"
+#
+#  3. At runtime, create sessions via PmuMetricsShim (C++) or
+#     pmu_metrics_create() directly (C).
 #
 # ── Perfetto SDK ─────────────────────────────────────────────────────────────
-#  The host project must have a "perfetto" target defined at the GN path
-#  referenced by the variable $pmu_metrics_perfetto_target (default shown in
-#  pmu_metrics.gni).  Typically this is the amalgamated SDK source_set at
-#  //third_party/perfetto:perfetto_sdk  (see third_party/perfetto/BUILD.gn).
+#  The :pmu_metrics_shim source_set below depends on the Perfetto target.
+#  The .so itself does NOT.
 
-import("//build/config/compiler/compiler.gni")    # for is_clang, etc. (optional)
 import("pmu_metrics.gni")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Public config — propagates include path to all dependents.
+# Configs
 # ─────────────────────────────────────────────────────────────────────────────
+
 config("pmu_metrics_public_config") {
+  # Exposes include/ to any target that deps on :pmu_metrics or :pmu_metrics_headers.
   include_dirs = [ "include" ]
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Private config — compile flags applied only to library sources.
-# ─────────────────────────────────────────────────────────────────────────────
 config("pmu_metrics_private_config") {
   include_dirs = [ "src" ]
-
   cflags_cc = [
     "-std=c++17",
     "-Wall",
     "-Wextra",
     "-Wpedantic",
     "-Wno-unused-parameter",
-    "-Wno-deprecated-declarations",   # Perfetto headers may trigger this
+    # Hide all symbols by default; only PMU_METRICS_API ones are exported.
+    "-fvisibility=hidden",
+    "-fvisibility-inlines-hidden",
   ]
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# pmu_metrics  — the static library itself.
+# :pmu_metrics_headers
 #
-# CONSTRAINT A: static_library — NEVER change to shared_library.
+# Header-only target — just exposes include/ with the C ABI header.
+# Useful for the host shim and for any TU that only needs the C types.
 # ─────────────────────────────────────────────────────────────────────────────
-static_library("pmu_metrics") {
+source_set("pmu_metrics_headers") {
+  public = [
+    "include/pmu_metrics/pmu_metrics_c.h",
+  ]
+  public_configs = [ ":pmu_metrics_public_config" ]
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# :pmu_metrics  —  the shared library
+#
+# NO Perfetto dep here.  Only perf_event_open (kernel ABI) + C++ stdlib.
+# ─────────────────────────────────────────────────────────────────────────────
+shared_library("pmu_metrics") {
+  output_name = "pmu_metrics"   # → libpmu_metrics.so
+
   sources = [
-    "src/pmu_data_source.cc",
-    "src/pmu_data_source.h",      # listed so IDEs and 'gn desc' see it
     "src/perf_group.cc",
     "src/perf_group.h",
     "src/pmu_session.cc",
-    "src/static_registration.cc",
   ]
 
-  # Public header exposed to dependents.
-  public = [ "include/pmu_metrics/pmu_metrics.h" ]
+  public = [ "include/pmu_metrics/pmu_metrics_c.h" ]
 
-  public_configs = [ ":pmu_metrics_public_config" ]
-  configs += [ ":pmu_metrics_private_config" ]
+  public_configs  = [ ":pmu_metrics_public_config" ]
+  configs        += [ ":pmu_metrics_private_config" ]
 
-  # CONSTRAINT B: Perfetto SDK must come from the host project's existing
-  # target so both sides share the same SDK instance (in-process backend).
-  # public_deps propagates the Perfetto include path to host TUs that
-  # include <perfetto.h> transitively.
-  public_deps = [ pmu_metrics_perfetto_target ]
+  # No Perfetto dep — intentional.
+  # perf_event_open is a raw syscall; no extra libs needed.
+  libs = []
 
-  # static_registration.cc must survive --gc-sections / LTO dead-code
-  # elimination because its only effect is a side-effecting constructor.
-  # The linker flag below keeps the whole archive when linking the final
-  # binary.  The host should add this library via:
-  #
-  #   ldflags = [ "-Wl,--whole-archive",
-  #               rebase_path(
-  #                 get_label_info("//third_party/pmu_metrics", "lib_output"),
-  #                 root_build_dir),
-  #               "-Wl,--no-whole-archive" ]
-  #
-  # OR (simpler) rely on the alwayslink below — GN passes -whole-archive
-  # automatically for the target that sets it.
-  complete_static_lib = false   # keep false; host controls link order
-
-  # alwayslink = true would work but forces --whole-archive on the entire
-  # lib.  We keep it false to avoid symbol bloat; instead static_registration
-  # uses a volatile dummy reference (see src/static_registration.cc).
+  # Export only the C ABI symbols; everything else is hidden.
+  # This is reinforced by -fvisibility=hidden in the private config above.
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Convenience group so the host can write:
-#   deps = [ "//third_party/pmu_metrics" ]
-# without knowing the internal target name.
-# (Only needed if pmu_metrics lives under a subdirectory of //third_party.)
+# :pmu_metrics_shim
+#
+# Header-only source_set compiled into the HOST binary (not the .so).
+# Provides:
+#   - PmuMetricsDataSource  (Perfetto DataSource)
+#   - PmuMetricsShim        (C++ RAII wrapper around the C ABI)
+#   - Static-init DataSource registration (when PMU_METRICS_DEFINE_DATA_SOURCE
+#     is defined in exactly one host TU)
+#
+# The host's target_server target should dep on this, NOT on :pmu_metrics
+# directly (though it also needs :pmu_metrics linked at runtime).
 # ─────────────────────────────────────────────────────────────────────────────
-group("pmu_metrics_group") {
-  public_deps = [ ":pmu_metrics" ]
+source_set("pmu_metrics_shim") {
+  public = [
+    "include/pmu_metrics/pmu_metrics_host_shim.h",
+  ]
+
+  public_configs = [ ":pmu_metrics_public_config" ]
+
+  public_deps = [
+    # Perfetto lives here — in the host, not in the .so.
+    pmu_metrics_perfetto_target,
+
+    # Needed for the C types referenced in the shim header.
+    ":pmu_metrics_headers",
+  ]
+
+  # The .so must be linked into the host binary at link time.
+  deps = [ ":pmu_metrics" ]
 }

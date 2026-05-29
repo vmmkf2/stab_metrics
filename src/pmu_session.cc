@@ -1,188 +1,203 @@
 // pmu_metrics/src/pmu_session.cc
 //
-// Implements PmuSession, IsPerfAvailable(), and HostArchitecture().
-// All perf_event fd management is delegated to PerfGroup (perf_group.h).
-// All Perfetto I/O is delegated to PmuDataSource (pmu_data_source.h).
+// Implements the C ABI (pmu_metrics_c.h).
+// ZERO Perfetto includes — all trace emission is via the writer_fn callback
+// supplied by the host at pmu_metrics_create() time.
 
-#include "pmu_metrics/pmu_metrics.h"
+#include "pmu_metrics/pmu_metrics_c.h"
 
 #include "perf_group.h"
-#include "pmu_data_source.h"
 
 #include <climits>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <functional>
+#include <sstream>
 #include <string>
 #include <thread>
 
-namespace pmu_metrics {
-
 // ---------------------------------------------------------------------------
-// Pimpl
+// Session internals (fully hidden — not in any public header)
 // ---------------------------------------------------------------------------
-struct PmuSession::Impl {
-    internal::PerfGroup   group;
-    MetricsSnapshot       last_snapshot;
-    uint64_t              track_uuid_ipc{0};
-    uint64_t              track_uuid_cpi{0};
-    std::string           track_name;
+struct pmu_metrics_session {
+    pmu_metrics::internal::PerfGroup group;
 
-    explicit Impl(internal::PerfGroup g, std::string name,
-                  uint64_t uuid_ipc, uint64_t uuid_cpi)
+    // Callbacks supplied by the host.
+    pmu_metrics_writer_fn     writer_fn;
+    pmu_metrics_descriptor_fn descriptor_fn;
+    void*                     userdata;
+
+    // Stable UUIDs for each emitted metric track.
+    uint64_t uuid_ipc;
+    uint64_t uuid_cpi;
+
+    // Copy of the track name (owned by this struct).
+    std::string track_name;
+
+    // Most recent snapshot.
+    pmu_metrics_snapshot_t last_snapshot{};
+
+    pmu_metrics_session(pmu_metrics::internal::PerfGroup g,
+                        std::string                      name,
+                        uint64_t                         u_ipc,
+                        uint64_t                         u_cpi,
+                        pmu_metrics_writer_fn            wfn,
+                        pmu_metrics_descriptor_fn        dfn,
+                        void*                            ud)
         : group(std::move(g))
-        , track_name(std::move(name))
-        , track_uuid_ipc(uuid_ipc)
-        , track_uuid_cpi(uuid_cpi) {}
+        , writer_fn(wfn)
+        , descriptor_fn(dfn)
+        , userdata(ud)
+        , uuid_ipc(u_ipc)
+        , uuid_cpi(u_cpi)
+        , track_name(std::move(name)) {}
 };
 
 // ---------------------------------------------------------------------------
-// UUID derivation — cheap, stable per (thread, name) pair.
-// Uses std::hash to combine thread::id and the track name string.
-// NOT cryptographic; collision probability is negligible for typical use.
+// UUID derivation — stable per (thread_id, track_name, metric_name).
 // ---------------------------------------------------------------------------
-static uint64_t MakeTrackUuid(std::thread::id tid, const std::string& name,
-                               const std::string& counter) {
+static uint64_t make_uuid(std::thread::id    tid,
+                           const std::string& name,
+                           const std::string& metric) {
     std::size_t h = std::hash<std::thread::id>{}(tid);
-    h ^= std::hash<std::string>{}(name)    + 0x9e3779b9u + (h << 6) + (h >> 2);
-    h ^= std::hash<std::string>{}(counter) + 0x9e3779b9u + (h << 6) + (h >> 2);
+    h ^= std::hash<std::string>{}(name)   + 0x9e3779b9u + (h << 6) + (h >> 2);
+    h ^= std::hash<std::string>{}(metric) + 0x9e3779b9u + (h << 6) + (h >> 2);
     return static_cast<uint64_t>(h);
 }
 
 // ---------------------------------------------------------------------------
-// PmuSession::Create
+// pmu_metrics_create
 // ---------------------------------------------------------------------------
-std::optional<PmuSession> PmuSession::Create(const PmuConfig& cfg) {
-    auto group = internal::PerfGroup::Open();
-    if (!group) return std::nullopt;
+extern "C" PMU_METRICS_API
+pmu_metrics_session_t* pmu_metrics_create(const pmu_metrics_config_t* cfg) {
+    if (!cfg || !cfg->writer_fn) return nullptr;
+
+    auto group = pmu_metrics::internal::PerfGroup::Open();
+    if (!group) return nullptr;
 
     auto tid = std::this_thread::get_id();
 
     std::string name;
-    if (cfg.track_name.empty()) {
-        // Build a default name from the thread id numeric value.
+    if (cfg->track_name && cfg->track_name[0] != '\0') {
+        name = cfg->track_name;
+    } else {
         std::ostringstream oss;
         oss << "pmu_metrics/" << tid;
         name = oss.str();
-    } else {
-        name = std::string(cfg.track_name);
     }
 
-    uint64_t uuid_ipc = MakeTrackUuid(tid, name, "ipc");
-    uint64_t uuid_cpi = MakeTrackUuid(tid, name, "cpi");
+    uint64_t u_ipc = make_uuid(tid, name, "ipc");
+    uint64_t u_cpi = make_uuid(tid, name, "cpi");
 
-    // Emit CounterTrack descriptor packets once so trace viewers label them.
-    internal::PmuDataSource::EmitTrackDescriptor(uuid_ipc, name, "ipc");
-    internal::PmuDataSource::EmitTrackDescriptor(uuid_cpi, name, "cpi");
+    auto* s = new pmu_metrics_session(std::move(*group),
+                                      std::move(name),
+                                      u_ipc, u_cpi,
+                                      cfg->writer_fn,
+                                      cfg->descriptor_fn,
+                                      cfg->userdata);
 
-    auto* impl = new Impl(std::move(*group), name, uuid_ipc, uuid_cpi);
-    return PmuSession(impl);
+    // Emit track descriptors once via the host callback.
+    if (s->descriptor_fn) {
+        s->descriptor_fn(s->userdata, u_ipc, s->track_name.c_str(), "ipc");
+        s->descriptor_fn(s->userdata, u_cpi, s->track_name.c_str(), "cpi");
+    }
+
+    return s;
 }
 
 // ---------------------------------------------------------------------------
-// PmuSession::Tick
+// pmu_metrics_tick
 // ---------------------------------------------------------------------------
-MetricsSnapshot PmuSession::Tick() {
-    MetricsSnapshot snap;
+extern "C" PMU_METRICS_API
+int pmu_metrics_tick(pmu_metrics_session_t*  session,
+                     pmu_metrics_snapshot_t* snap_out) {
+    if (!session) return -1;
 
-    // Wall-clock timestamp.
+    pmu_metrics_snapshot_t snap{};
+
+    // Timestamp.
     struct timespec ts{};
     ::clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
     snap.timestamp_ns = static_cast<uint64_t>(ts.tv_sec) * 1'000'000'000ULL
                       + static_cast<uint64_t>(ts.tv_nsec);
 
-    // Read counters from the kernel.
-    internal::PerfGroupReadFormat raw{};
-    if (!impl_ || !impl_->group.Read(raw)) {
-        // Counters unavailable (stub or fd error) — return zero snapshot.
-        if (impl_) impl_->last_snapshot = snap;
-        return snap;
+    // Read counters.
+    pmu_metrics::internal::PerfGroupReadFormat raw{};
+    if (!session->group.Read(raw)) {
+        session->last_snapshot = snap;
+        if (snap_out) *snap_out = snap;
+        return -1;
     }
 
-    snap.instructions = raw.values[1].value;
     snap.cycles       = raw.values[0].value;
+    snap.instructions = raw.values[1].value;
+    snap.scaled       = (raw.time_running > 0) &&
+                        (raw.time_running < raw.time_enabled) ? 1 : 0;
 
-    // Detect kernel multiplexing.
-    snap.scaled = (raw.time_running > 0) &&
-                  (raw.time_running < raw.time_enabled);
-
-    // Scale raw values if multiplexed.
     if (snap.scaled && raw.time_running > 0) {
-        double factor = static_cast<double>(raw.time_enabled)
-                      / static_cast<double>(raw.time_running);
-        snap.instructions = static_cast<uint64_t>(snap.instructions * factor);
-        snap.cycles       = static_cast<uint64_t>(snap.cycles       * factor);
+        double f = static_cast<double>(raw.time_enabled)
+                 / static_cast<double>(raw.time_running);
+        snap.cycles       = static_cast<uint64_t>(snap.cycles       * f);
+        snap.instructions = static_cast<uint64_t>(snap.instructions * f);
     }
 
-    // Derive IPC / CPI.
     if (snap.cycles > 0) {
         snap.ipc = static_cast<double>(snap.instructions)
                  / static_cast<double>(snap.cycles);
         snap.cpi = 1.0 / snap.ipc;
     }
 
-    // Emit Perfetto counter packets.
-    internal::PmuDataSource::EmitCounterPacket(
-        impl_->track_uuid_ipc, snap.timestamp_ns, "ipc", snap.ipc);
-    internal::PmuDataSource::EmitCounterPacket(
-        impl_->track_uuid_cpi, snap.timestamp_ns, "cpi", snap.cpi);
+    // Emit via host-provided callbacks — NO Perfetto calls here.
+    session->writer_fn(session->userdata,
+                       session->uuid_ipc, snap.timestamp_ns, "ipc", snap.ipc);
+    session->writer_fn(session->userdata,
+                       session->uuid_cpi, snap.timestamp_ns, "cpi", snap.cpi);
 
-    // Reset the counter group for the next interval.
-    impl_->group.Reset();
+    session->group.Reset();
+    session->last_snapshot = snap;
 
-    impl_->last_snapshot = snap;
-    return snap;
+    if (snap_out) *snap_out = snap;
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
-// PmuSession::LastSnapshot
+// pmu_metrics_last_snapshot
 // ---------------------------------------------------------------------------
-const MetricsSnapshot& PmuSession::LastSnapshot() const noexcept {
-    static const MetricsSnapshot kEmpty{};
-    return impl_ ? impl_->last_snapshot : kEmpty;
+extern "C" PMU_METRICS_API
+const pmu_metrics_snapshot_t* pmu_metrics_last_snapshot(
+        const pmu_metrics_session_t* session) {
+    if (!session) return nullptr;
+    return &session->last_snapshot;
 }
 
 // ---------------------------------------------------------------------------
-// Destructor / move
+// pmu_metrics_destroy
 // ---------------------------------------------------------------------------
-PmuSession::PmuSession(Impl* impl) noexcept : impl_(impl) {}
-
-PmuSession::~PmuSession() {
-    delete impl_;
-}
-
-PmuSession::PmuSession(PmuSession&& o) noexcept : impl_(o.impl_) {
-    o.impl_ = nullptr;
-}
-
-PmuSession& PmuSession::operator=(PmuSession&& o) noexcept {
-    if (this != &o) {
-        delete impl_;
-        impl_   = o.impl_;
-        o.impl_ = nullptr;
-    }
-    return *this;
+extern "C" PMU_METRICS_API
+void pmu_metrics_destroy(pmu_metrics_session_t* session) {
+    delete session;
 }
 
 // ---------------------------------------------------------------------------
-// IsPerfAvailable
+// pmu_metrics_is_perf_available
 // ---------------------------------------------------------------------------
-bool IsPerfAvailable() noexcept {
-    // Read /proc/sys/kernel/perf_event_paranoid.
-    // Values <= 1 allow unprivileged use; 2+ blocks most events.
+extern "C" PMU_METRICS_API
+int pmu_metrics_is_perf_available(void) {
     FILE* f = std::fopen("/proc/sys/kernel/perf_event_paranoid", "r");
-    if (!f) return false;
+    if (!f) return 0;
     int paranoid = 3;
     std::fscanf(f, "%d", &paranoid);
     std::fclose(f);
-    return paranoid <= 1;
+    return paranoid <= 1 ? 1 : 0;
 }
 
 // ---------------------------------------------------------------------------
-// HostArchitecture
+// pmu_metrics_host_arch
 // ---------------------------------------------------------------------------
-std::string_view HostArchitecture() noexcept {
+extern "C" PMU_METRICS_API
+const char* pmu_metrics_host_arch(void) {
 #if defined(__aarch64__)
     return "aarch64";
 #elif defined(__x86_64__)
@@ -192,4 +207,10 @@ std::string_view HostArchitecture() noexcept {
 #endif
 }
 
-}  // namespace pmu_metrics
+// ---------------------------------------------------------------------------
+// pmu_metrics_version_string
+// ---------------------------------------------------------------------------
+extern "C" PMU_METRICS_API
+const char* pmu_metrics_version_string(void) {
+    return "0.1.0";
+}
