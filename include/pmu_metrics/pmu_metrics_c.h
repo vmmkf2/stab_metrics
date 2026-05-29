@@ -1,26 +1,48 @@
 /* pmu_metrics/include/pmu_metrics/pmu_metrics_c.h
  *
- * Stable C ABI for libpmu_metrics.so.
+ * Stable C ABI for libpmu_metrics.so
  *
- * ── Rules ───────────────────────────────────────────────────────────────────
- *  • No C++ types, no Perfetto types, no linux/perf_event.h types.
- *  • All symbols are explicitly exported via PMU_METRICS_API.
- *    Every other symbol in the .so is hidden (-fvisibility=hidden).
- *  • This header is the ONLY file shipped to host consumers alongside the .so.
- *    The host-side Perfetto shim (pmu_metrics_host_shim.h) is separate and
- *    only needed by the host project's own build — not by end consumers.
+ * ── Purpose ──────────────────────────────────────────────────────────────────
+ *  The library extends the host project's existing PMU counter collection by
+ *  gathering *proprietary* counters and emitting *derived metrics* (whose
+ *  formulas are hidden from the host's source tree) into the host's existing
+ *  Perfetto trace buffer.
  *
- * ── Perfetto integration model ──────────────────────────────────────────────
- *  The .so contains ZERO Perfetto symbols.  Instead, the host registers a
- *  writer callback (pmu_metrics_writer_fn) at session creation time.
- *  On every Tick() the library calls this function with:
- *    - the track UUID
- *    - a timestamp
- *    - a metric name string
- *    - the metric value
- *  The host-side shim (pmu_metrics_host_shim.h) provides a ready-made
- *  implementation of this callback that writes into the host's Perfetto
- *  trace buffer.
+ *  The host project already owns:
+ *    • perf_event_open fd groups for standard counters
+ *    • a running Perfetto tracing session
+ *    • logic to write CounterTrack packets
+ *
+ *  This library adds:
+ *    • secret PMU event codes (proprietary variant) or extended HW events
+ *    • formulas that derive higher-level metrics from those counters
+ *    • per-thread fd management (keyed by Linux tid)
+ *
+ * ── Host interaction model ────────────────────────────────────────────────────
+ *
+ *   1. pmu_metrics_init()       — called once at program startup
+ *                                 host provides a write_fn that bridges into
+ *                                 its existing Perfetto write path
+ *
+ *   2. pmu_metrics_attach(tid)  — called when a thread of interest starts
+ *                                 library opens its fd group for that tid
+ *
+ *   3. pmu_metrics_sample(tid)  — called periodically by the host
+ *                                 library reads counters, computes metrics,
+ *                                 calls write_fn for each derived metric
+ *                                 host never sees counter values or formulas
+ *
+ *   4. pmu_metrics_detach(tid)  — called when a thread finishes
+ *
+ *   5. pmu_metrics_shutdown()   — called once at program exit
+ *
+ * ── What the host sees ───────────────────────────────────────────────────────
+ *  Only the write_fn call:  (track_uuid, timestamp_ns, metric_name, value)
+ *  No raw counter values. No event codes. No formulas.
+ *
+ * ── Symbol visibility ────────────────────────────────────────────────────────
+ *  Compiled with -fvisibility=hidden.  Only PMU_METRICS_API symbols exported.
+ *  Zero Perfetto symbols in the .so.
  */
 
 #pragma once
@@ -40,132 +62,141 @@ extern "C" {
 
 /* ── Version ─────────────────────────────────────────────────────────────── */
 #define PMU_METRICS_VERSION_MAJOR 0
-#define PMU_METRICS_VERSION_MINOR 1
+#define PMU_METRICS_VERSION_MINOR 2
 #define PMU_METRICS_VERSION_PATCH 0
 
-PMU_METRICS_API const char* pmu_metrics_version_string(void);
+PMU_METRICS_API const char* pmu_metrics_version(void);
 
-/* ── Aggregated metrics snapshot ─────────────────────────────────────────── */
-typedef struct pmu_metrics_snapshot {
-    uint64_t instructions;   /* raw instruction count for the interval     */
-    uint64_t cycles;         /* raw cycle count for the interval           */
-    double   ipc;            /* instructions per cycle                     */
-    double   cpi;            /* cycles per instruction                     */
-    uint64_t timestamp_ns;   /* CLOCK_MONOTONIC_RAW at sample time         */
-    int      scaled;         /* 1 if kernel multiplexed and values scaled  */
-} pmu_metrics_snapshot_t;
-
-/* ── Writer callback ─────────────────────────────────────────────────────── */
+/* ── Write callback ──────────────────────────────────────────────────────── */
 /*
- * The host provides one function of this type at session creation time.
- * The library calls it synchronously from pmu_metrics_tick().
+ * Provided by the host at pmu_metrics_init() time.
+ * Called synchronously from pmu_metrics_sample() — once per derived metric.
+ *
+ * The host implements this by writing a CounterTrack packet into its existing
+ * Perfetto trace buffer.  See pmu_metrics_host_shim.h for a ready-made
+ * implementation.
  *
  * Parameters:
- *   userdata      — opaque pointer passed through from pmu_metrics_config_t
- *   track_uuid    — stable 64-bit ID for this (session, metric_name) pair;
- *                   use as Perfetto CounterTrack uuid
- *   timestamp_ns  — CLOCK_MONOTONIC_RAW nanoseconds
- *   metric_name   — NUL-terminated ASCII string, e.g. "ipc" or "cpi"
- *   value         — the metric value to record
+ *   userdata     — opaque value from pmu_metrics_init_args_t, passed through
+ *   track_uuid   — stable 64-bit track identifier, unique per (tid, metric)
+ *                  use directly as Perfetto CounterTrack uuid
+ *   timestamp_ns — CLOCK_MONOTONIC_RAW nanoseconds at sample time
+ *   metric_name  — NUL-terminated ASCII label, e.g. "ipc", "cpi"
+ *                  stable across calls; the host may use it for track naming
+ *   value        — the computed metric value
  */
-typedef void (*pmu_metrics_writer_fn)(void*       userdata,
-                                      uint64_t    track_uuid,
-                                      uint64_t    timestamp_ns,
-                                      const char* metric_name,
-                                      double      value);
+typedef void (*pmu_metrics_write_fn)(void*       userdata,
+                                     uint64_t    track_uuid,
+                                     uint64_t    timestamp_ns,
+                                     const char* metric_name,
+                                     double      value);
 
 /*
- * Called once per session at creation time so the host can emit a
- * CounterTrack descriptor packet (track name, unit string, etc.) before the
- * first sample arrives.
+ * Optional: called once per (tid, metric) at pmu_metrics_attach() time so
+ * the host can emit a CounterTrack descriptor packet (name, unit) before the
+ * first sample arrives.  May be NULL.
  *
  * Parameters:
- *   userdata      — same opaque pointer
- *   track_uuid    — same UUID as will be used for subsequent writer_fn calls
- *   track_name    — human-readable name for the track, e.g. "pmu/my_bench"
- *   metric_name   — "ipc", "cpi", etc.
+ *   userdata     — same opaque value
+ *   track_uuid   — same UUID as subsequent write_fn calls for this metric
+ *   metric_name  — same label as subsequent write_fn calls
+ *   unit         — human-readable unit string, e.g. "instr/cycle"
  */
-typedef void (*pmu_metrics_descriptor_fn)(void*       userdata,
-                                          uint64_t    track_uuid,
-                                          const char* track_name,
-                                          const char* metric_name);
+typedef void (*pmu_metrics_describe_fn)(void*       userdata,
+                                        uint64_t    track_uuid,
+                                        const char* metric_name,
+                                        const char* unit);
 
-/* ── Configuration ───────────────────────────────────────────────────────── */
-typedef struct pmu_metrics_config {
-    /* Human-readable track name embedded in Perfetto CounterTrack descriptor.
-     * May be NULL — defaults to "pmu_metrics/<thread_id>".
-     * The library copies this string; caller may free after Create(). */
-    const char* track_name;
+/* ── Init args ───────────────────────────────────────────────────────────── */
+typedef struct pmu_metrics_init_args {
+    /* Required: bridge into the host's Perfetto write path. */
+    pmu_metrics_write_fn    write_fn;
 
-    /* Writer callback — called on every Tick() to emit one counter packet.
-     * MUST NOT be NULL. */
-    pmu_metrics_writer_fn writer_fn;
+    /* Optional: emit CounterTrack descriptors at attach time. */
+    pmu_metrics_describe_fn describe_fn;
 
-    /* Descriptor callback — called once at Create() per metric.
-     * May be NULL if the host doesn't need to emit track descriptors. */
-    pmu_metrics_descriptor_fn descriptor_fn;
-
-    /* Opaque pointer forwarded to writer_fn and descriptor_fn unchanged. */
+    /* Opaque value forwarded unchanged to write_fn and describe_fn. */
     void* userdata;
 
-    /* Reserved for future flags (MPKI, branch miss rate, TMA …).
-     * Set to 0 for the current version. */
+    /* Name prefix for CounterTrack descriptors: "<prefix>/<tid>/<metric>".
+     * If NULL, defaults to "pmu_metrics". */
+    const char* track_name_prefix;
+
+    /* Reserved for future flags.  Set to 0. */
     uint32_t flags;
-} pmu_metrics_config_t;
+} pmu_metrics_init_args_t;
 
-/* ── Session handle ──────────────────────────────────────────────────────── */
+/* ── Error codes ─────────────────────────────────────────────────────────── */
+#define PMU_METRICS_OK            0
+#define PMU_METRICS_ERR_ARGS     -1   /* NULL or invalid args               */
+#define PMU_METRICS_ERR_PERF     -2   /* perf_event_open failed (see errno) */
+#define PMU_METRICS_ERR_ALREADY  -3   /* tid already attached               */
+#define PMU_METRICS_ERR_NOTFOUND -4   /* tid not attached                   */
+#define PMU_METRICS_ERR_STATE    -5   /* init not called / already shutdown */
+
+/* ── Lifecycle ───────────────────────────────────────────────────────────── */
+
 /*
- * Opaque handle.  Obtain via pmu_metrics_create(), release via
- * pmu_metrics_destroy().  Not thread-safe across sessions; each thread
- * should own its own handle.
- */
-typedef struct pmu_metrics_session pmu_metrics_session_t;
-
-/* ── API ─────────────────────────────────────────────────────────────────── */
-
-/*
- * Create a session for the calling thread.
- * Opens perf_event_open(2) file descriptors (pid=0, cpu=-1).
- * Calls cfg->descriptor_fn once per metric (if non-NULL).
+ * Initialise the library.  Call once before any other function.
  *
- * Returns NULL on failure (perf_event_paranoid too high, unsupported arch,
- * or kernel error — check errno).
- */
-PMU_METRICS_API
-pmu_metrics_session_t* pmu_metrics_create(const pmu_metrics_config_t* cfg);
-
-/*
- * Read counters for the interval since the last Tick (or Create),
- * derive metrics, call cfg->writer_fn for each metric, reset counters.
+ * The library does NOT open any perf fds here — fd groups are opened lazily
+ * per tid in pmu_metrics_attach().
  *
- * Fills *snap_out if non-NULL.
- * Returns 0 on success, -1 on read error (check errno).
+ * Returns PMU_METRICS_OK or PMU_METRICS_ERR_ARGS.
  */
 PMU_METRICS_API
-int pmu_metrics_tick(pmu_metrics_session_t*  session,
-                     pmu_metrics_snapshot_t* snap_out  /* may be NULL */);
+int pmu_metrics_init(const pmu_metrics_init_args_t* args);
 
 /*
- * Returns a pointer to the most recent snapshot without reading counters.
- * The pointer is valid until the next pmu_metrics_tick() or pmu_metrics_destroy().
+ * Release all resources.  Safe to call multiple times.
+ * Implicitly detaches all attached tids.
  */
 PMU_METRICS_API
-const pmu_metrics_snapshot_t* pmu_metrics_last_snapshot(
-        const pmu_metrics_session_t* session);
+void pmu_metrics_shutdown(void);
+
+/* ── Per-thread management ───────────────────────────────────────────────── */
 
 /*
- * Destroy a session and close all perf fds.
- * Safe to call with NULL.
+ * Open the proprietary perf fd group for the given Linux thread id.
+ * Emits CounterTrack descriptor packets via describe_fn (if non-NULL).
+ *
+ * tid — Linux thread id (gettid() / syscall(SYS_gettid)), NOT pthread_t.
+ *
+ * Returns PMU_METRICS_OK, PMU_METRICS_ERR_PERF, or PMU_METRICS_ERR_ALREADY.
  */
 PMU_METRICS_API
-void pmu_metrics_destroy(pmu_metrics_session_t* session);
+int pmu_metrics_attach(uint32_t tid);
+
+/*
+ * Close the perf fd group for the given tid.
+ * It is safe to call this after the thread has exited.
+ *
+ * Returns PMU_METRICS_OK or PMU_METRICS_ERR_NOTFOUND.
+ */
+PMU_METRICS_API
+int pmu_metrics_detach(uint32_t tid);
+
+/*
+ * Read counters for the given tid, compute all derived metrics, and call
+ * write_fn once per metric.
+ *
+ * Must be called from ANY thread — the fd was opened with pid=tid so the
+ * kernel measures that specific thread regardless of which thread reads it.
+ *
+ * After reading, resets the counter group so the next sample measures
+ * only the interval since this call.
+ *
+ * Returns PMU_METRICS_OK, PMU_METRICS_ERR_NOTFOUND, or PMU_METRICS_ERR_PERF.
+ */
+PMU_METRICS_API
+int pmu_metrics_sample(uint32_t tid);
 
 /* ── Utility ─────────────────────────────────────────────────────────────── */
 
-/* Returns 1 if perf_event_paranoid <= 1 (unprivileged use allowed). */
-PMU_METRICS_API int  pmu_metrics_is_perf_available(void);
+/* 1 if /proc/sys/kernel/perf_event_paranoid <= 1. */
+PMU_METRICS_API int         pmu_metrics_is_perf_available(void);
 
-/* Returns a string like "aarch64" or "x86_64". */
+/* "aarch64", "x86_64", etc. */
 PMU_METRICS_API const char* pmu_metrics_host_arch(void);
 
 #ifdef __cplusplus

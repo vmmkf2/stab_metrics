@@ -1,12 +1,48 @@
 # pmu_metrics
 
-A C++17 shared library (`libpmu_metrics.so`) that collects hardware PMU
-counters via `perf_event_open(2)` and reports derived metrics to the host
-project via a **writer callback**.  The host feeds those callbacks into its
-existing Perfetto trace buffer.
+A C++17 shared library (`libpmu_metrics.so`) that **extends** the host
+project's existing PMU counter collection by gathering proprietary counters
+and emitting derived metrics into the host's existing Perfetto trace buffer.
 
-The library is **shipped as a prebuilt** in two variants: **base** and
-**proprietary**.  Both expose the same C ABI.
+The library hides from the host's source tree:
+- which raw PMU event codes are opened (especially the proprietary variant)
+- the formulas that derive higher-level metrics from those counters
+
+The host project already owns the Perfetto session and its own counter
+collection.  This library adds tracks alongside them.
+
+---
+
+## Host interaction model
+
+```
+host                                  libpmu_metrics.so
+────────────────────────────────────  ──────────────────────────────────────
+pmu_metrics_init(&args)           →   stores write_fn, describe_fn, userdata
+                                      does NOT open any perf fds yet
+
+[worker thread A starts]
+pmu_metrics_attach(tid_A)         →   opens secret perf fd group for tid_A
+                                      calls describe_fn once per metric track
+
+[worker thread B starts]
+pmu_metrics_attach(tid_B)         →   opens secret perf fd group for tid_B
+
+[host sampling loop, any thread]
+pmu_metrics_sample(tid_A)         →   reads fds, computes formulas (hidden)
+                                      calls write_fn(track_uuid, ts, "ipc", v)
+                                      calls write_fn(track_uuid, ts, "cpi", v)
+                                      ...
+pmu_metrics_sample(tid_B)         →   same for tid_B
+
+[worker thread A finishes]
+pmu_metrics_detach(tid_A)         →   closes fd group for tid_A
+
+pmu_metrics_shutdown()            →   closes all remaining fds
+```
+
+**The host sees only:** `(track_uuid, timestamp_ns, metric_name, value)` via
+`write_fn`.  No raw counter values.  No event codes.  No formulas.
 
 ---
 
@@ -16,24 +52,20 @@ The library is **shipped as a prebuilt** in two variants: **base** and
 ┌──────────────────────────────────────────────────────┐
 │  host binary (target_server)                         │
 │                                                      │
-│  ┌────────────────────────┐  ┌─────────────────────┐ │
-│  │  Perfetto SDK          │  │  libpmu_metrics.so  │ │
-│  │  (host-owned)          │  │                     │ │
-│  │                        │  │  perf_event_open    │ │
-│  │  PmuMetricsDataSource  │◄─│  writer_fn callback │ │
-│  │  (compiled into host   │  │                     │ │
-│  │   via _host_shim.h)    │  │  ZERO Perfetto syms │ │
-│  └────────────────────────┘  └─────────────────────┘ │
+│  ┌──────────────────────┐  ┌──────────────────────┐  │
+│  │  Perfetto SDK        │  │  libpmu_metrics.so   │  │
+│  │  (host-owned)        │  │                      │  │
+│  │                      │  │  perf_event_open()   │  │
+│  │  host's DataSource   │  │  per-tid fd map      │  │
+│  │  ────────────────    │  │  secret formulas     │  │
+│  │  write_fn impl  ◄────┼──┼─ write_fn(uuid,ts,v) │  │
+│  └──────────────────────┘  └──────────────────────┘  │
 └──────────────────────────────────────────────────────┘
 ```
 
-- `libpmu_metrics.so` contains **zero Perfetto symbols**.
-  Compiled with `-fvisibility=hidden`; only `PMU_METRICS_API` symbols exported.
-- The **host** compiles `pmu_metrics_host_shim.h` (header-only) into its own
-  binary.  This provides the Perfetto `DataSource` and the `PmuMetricsShim`
-  C++ wrapper.
-- The `.so` calls back into the host via a plain C function pointer
-  (`pmu_metrics_writer_fn`) — no C++ ABI, no Perfetto linkage.
+- `libpmu_metrics.so` — **zero Perfetto symbols**, `-fvisibility=hidden`
+- `pmu_metrics_host_shim.h` — header compiled into the host; provides
+  `PmuMetricsManager` RAII wrapper and template helpers for `write_fn`
 
 ---
 
@@ -41,149 +73,102 @@ The library is **shipped as a prebuilt** in two variants: **base** and
 
 ```
 pmu_metrics/
-├── BUILD.gn                                 ← shared_library + shim source_set
-├── pmu_metrics.gni                          ← declare_args: perfetto target
-├── README.md
+├── BUILD.gn
+├── pmu_metrics.gni
 ├── include/pmu_metrics/
-│   ├── pmu_metrics_c.h                      ← C ABI shipped with the .so
-│   └── pmu_metrics_host_shim.h              ← host-side Perfetto DataSource
+│   ├── pmu_metrics_c.h             ← C ABI (shipped with .so)
+│   └── pmu_metrics_host_shim.h     ← host-side bridge helpers (host-compiled)
 └── src/
-    ├── perf_group.h / .cc                   ← RAII perf fd group (STUB)
-    └── pmu_session.cc                       ← C ABI implementation
+    ├── perf_group.h / .cc          ← RAII perf fd group (STUB)
+    └── pmu_session.cc              ← C ABI impl, per-tid fd map, formulas
 ```
 
 ---
 
-## Design decisions
-
-### Shared library + C ABI
-
-The library ships in two variants (base / proprietary) with a stable C ABI
-so the host project can link against either without recompiling.
-
-### Zero Perfetto symbols in the .so
-
-If the `.so` embedded its own Perfetto SDK copy, the host binary would have
-**two SDK instances** in the same process — duplicate singleton state, broken
-DataSource registry, no packets in the trace.
-
-Solution: compile the `.so` with `-fvisibility=hidden`.  The Perfetto
-`DataSource` (`PmuMetricsDataSource`) lives in `pmu_metrics_host_shim.h`,
-compiled directly into the host binary alongside the host's own Perfetto SDK.
-
-### Writer callback bridge
-
-The `.so` accepts a `pmu_metrics_writer_fn` function pointer at session
-creation time.  On every `pmu_metrics_tick()` it calls this function with
-`(track_uuid, timestamp_ns, metric_name, value)`.  The shim header wires this
-to `PmuMetricsDataSource::EmitSample()`.
-
-### Counter scope: thread-local (`pid=0, cpu=-1`)
-
-One `pmu_metrics_session_t` per thread.  Sessions are independent.
-
-### Collection model: explicit `pmu_metrics_tick()`
-
-No background thread.  The host drives sampling at its own cadence.
-
-### Architecture: aarch64, IPC + CPI (initial)
-
-Generic `PERF_TYPE_HARDWARE` events.  No root required when
-`perf_event_paranoid ≤ 1`.
-
----
-
-## Host GN integration
-
-### 1. Obtain the Perfetto SDK amalgam
-
-```bash
-curl -L https://github.com/google/perfetto/releases/latest/download/\
-perfetto-cpp-sdk-src.zip -o /tmp/sdk.zip
-unzip /tmp/sdk.zip -d third_party/perfetto/sdk/
-```
-
-### 2. Place pmu_metrics in your source tree
-
-```
-your_project/third_party/pmu_metrics/   ← this repo
-your_project/third_party/perfetto/      ← Perfetto SDK
-```
-
-### 3. Wire target_server
+## GN integration
 
 ```gn
-# In target_server's BUILD.gn:
+# target_server BUILD.gn
 executable("target_server") {
-  sources = [ ... ]
-
   deps = [
-    # Pulls in: PmuMetricsDataSource, PmuMetricsShim, C ABI header,
-    #           libpmu_metrics.so (linked at build time), Perfetto SDK.
-    "//third_party/pmu_metrics:pmu_metrics_shim",
+    "//third_party/pmu_metrics:pmu_metrics_shim",  # headers + links .so
+    # ... existing deps
   ]
 }
 ```
 
-### 4. Register the DataSource (once per binary)
+---
 
-In exactly **one** `.cc` file in the host:
-
-```cpp
-#define PMU_METRICS_DEFINE_DATA_SOURCE
-#include "pmu_metrics/pmu_metrics_host_shim.h"
-```
-
-In all other files that use the shim:
+## Host wiring (C++ example)
 
 ```cpp
-#include "pmu_metrics/pmu_metrics_host_shim.h"
-```
-
-### 5. Use
-
-```cpp
+// In the file where your existing DataSource lives:
 #include "pmu_metrics/pmu_metrics_host_shim.h"
 
-// Check availability first.
-if (!pmu_metrics_is_perf_available()) { /* adjust perf_event_paranoid */ }
+// Implement write_fn in terms of your existing Perfetto DataSource.
+// Template sketch (adapt MyDataSource to your actual type):
+static void PmuWriteFn(void*       /*userdata*/,
+                       uint64_t    track_uuid,
+                       uint64_t    timestamp_ns,
+                       const char* /*metric_name*/,
+                       double      value) {
+    MyDataSource::Trace([&](MyDataSource::TraceContext ctx) {
+        auto packet = ctx.NewTracePacket();
+        packet->set_timestamp(timestamp_ns);
+        auto* te = packet->set_track_event();
+        te->set_track_uuid(track_uuid);
+        te->set_type(perfetto::protos::pbzero::TrackEvent::TYPE_COUNTER);
+        te->set_counter_value_double(value);
+    });
+}
 
-// C++ wrapper (recommended):
-PmuMetricsShim pmu("my_benchmark");
-if (!pmu) { /* perf_event_open failed */ }
+static void PmuDescribeFn(void*       /*userdata*/,
+                          uint64_t    track_uuid,
+                          const char* metric_name,
+                          const char* unit) {
+    MyDataSource::Trace([&](MyDataSource::TraceContext ctx) {
+        auto packet = ctx.NewTracePacket();
+        packet->set_timestamp(0);
+        auto* td = packet->set_track_descriptor();
+        td->set_uuid(track_uuid);
+        td->set_name(metric_name);
+        td->set_counter()->set_unit_name(unit);
+    });
+}
 
-// ... do work ...
-auto snap = pmu.Tick();
-printf("IPC=%.3f  CPI=%.3f\n", snap.ipc, snap.cpi);
-// CounterTrack packets appear in the host's .perfetto-trace automatically.
+// ── At program startup (after Perfetto::Initialize) ──────────────────────
+pmu_metrics::host::PmuMetricsManager pmu_manager(
+    PmuWriteFn,
+    PmuDescribeFn,
+    nullptr,          // userdata — not needed for in-process DataSource
+    "pmu_ext"         // track name prefix in the trace viewer
+);
 
-// Or raw C ABI:
-pmu_metrics_config_t cfg{};
-cfg.track_name    = "my_benchmark";
-cfg.writer_fn     = my_writer;
-cfg.descriptor_fn = my_descriptor;
-auto* s = pmu_metrics_create(&cfg);
-pmu_metrics_tick(s, nullptr);
-pmu_metrics_destroy(s);
-```
+// ── When a worker thread starts ──────────────────────────────────────────
+pmu_manager.Attach(gettid());   // gettid() or syscall(SYS_gettid)
 
-### 6. Override Perfetto target (if needed)
+// ── In the host's sampling loop ──────────────────────────────────────────
+pmu_manager.Sample(worker_tid); // can be called from any thread
 
-```gn
-# args.gn
-pmu_metrics_perfetto_target = "//your/existing:perfetto"
+// ── When a worker thread finishes ────────────────────────────────────────
+pmu_manager.Detach(worker_tid);
+
+// ── At program exit ──────────────────────────────────────────────────────
+// PmuMetricsManager destructor calls pmu_metrics_shutdown() automatically.
 ```
 
 ---
 
-## What the two GN targets produce
+## Error codes
 
-| Target | Output | Deps on Perfetto? |
+| Code | Value | Meaning |
 |---|---|---|
-| `//third_party/pmu_metrics:pmu_metrics` | `libpmu_metrics.so` | No |
-| `//third_party/pmu_metrics:pmu_metrics_shim` | compiled into host binary | Yes (host's SDK) |
-
----
+| `PMU_METRICS_OK` | 0 | Success |
+| `PMU_METRICS_ERR_ARGS` | -1 | NULL or invalid arguments |
+| `PMU_METRICS_ERR_PERF` | -2 | `perf_event_open` failed (check `errno`) |
+| `PMU_METRICS_ERR_ALREADY` | -3 | `tid` already attached |
+| `PMU_METRICS_ERR_NOTFOUND` | -4 | `tid` not attached |
+| `PMU_METRICS_ERR_STATE` | -5 | `pmu_metrics_init` not called |
 
 ## Kernel requirements
 
@@ -192,3 +177,5 @@ pmu_metrics_perfetto_target = "//your/existing:perfetto"
 | Linux kernel | ≥ 4.3 (aarch64 PMU) |
 | `perf_event_paranoid` | ≤ 1 or `CAP_PERFMON` |
 | `CAP_SYS_ADMIN` | Not required (`exclude_kernel=1`) |
+
+Check: `pmu_metrics_is_perf_available()`.

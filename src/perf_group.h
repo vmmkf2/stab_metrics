@@ -41,6 +41,11 @@ public:
     // Returns nullopt on failure (sets errno).
     [[nodiscard]] static std::optional<PerfGroup> Open() noexcept;
 
+    // Open the counter group for a specific Linux tid (pid=tid, cpu=-1).
+    // Can be called from any thread — measures the target thread on any CPU.
+    // Returns nullopt on failure (sets errno).
+    [[nodiscard]] static std::optional<PerfGroup> OpenForTid(pid_t tid) noexcept;
+
     ~PerfGroup();
 
     PerfGroup(const PerfGroup&)            = delete;

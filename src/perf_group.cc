@@ -1,7 +1,7 @@
 // pmu_metrics/src/perf_group.cc
 //
 // STUB implementation of PerfGroup.
-// TODO: replace stub bodies with real perf_event_open(2) syscalls.
+// TODO: replace OpenImpl() body with real perf_event_open(2) syscalls.
 
 #include "perf_group.h"
 
@@ -9,7 +9,6 @@
 #include <cstring>
 #include <unistd.h>
 
-// Linux perf_event_open header — only needed in this TU.
 #include <linux/perf_event.h>
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
@@ -17,9 +16,8 @@
 namespace pmu_metrics::internal {
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Syscall wrapper
 // ---------------------------------------------------------------------------
-
 static long perf_event_open(struct perf_event_attr* attr,
                              pid_t pid, int cpu,
                              int group_fd, unsigned long flags) noexcept {
@@ -27,19 +25,25 @@ static long perf_event_open(struct perf_event_attr* attr,
 }
 
 // ---------------------------------------------------------------------------
-// PerfGroup::Open  — STUB
+// OpenImpl — shared by Open() and OpenForTid().
 //
-// TODO: fill in the perf_event_attr fields for aarch64:
+// pid = 0      → measure calling thread  (used by Open())
+// pid = <tid>  → measure that Linux tid  (used by OpenForTid())
+// cpu = -1     → any CPU
+//
+// TODO: fill in the perf_event_attr fields:
 //   leader : PERF_TYPE_HARDWARE / PERF_COUNT_HW_CPU_CYCLES
 //   member : PERF_TYPE_HARDWARE / PERF_COUNT_HW_INSTRUCTIONS
-//   Both   : .exclude_kernel = 1 (userspace only, no CAP_SYS_ADMIN needed)
-//             .disabled      = 1 (start explicitly via ioctl ENABLE)
-//             .read_format   = PERF_FORMAT_GROUP | PERF_FORMAT_TOTAL_TIME_ENABLED
-//                              | PERF_FORMAT_TOTAL_TIME_RUNNING
+//   Both   : .exclude_kernel = 1  (userspace only, no CAP_SYS_ADMIN)
+//             .disabled      = 1  (start via ioctl ENABLE after open)
+//             .read_format   = PERF_FORMAT_GROUP
+//                            | PERF_FORMAT_TOTAL_TIME_ENABLED
+//                            | PERF_FORMAT_TOTAL_TIME_RUNNING
+//
+// PROPRIETARY variant: add additional secret event configs here.
 // ---------------------------------------------------------------------------
-std::optional<PerfGroup> PerfGroup::Open() noexcept {
-    // --- STUB: always return nullopt until the real implementation lands ---
-    // Real implementation sketch:
+static std::optional<PerfGroup> OpenImpl(pid_t pid) noexcept {
+    // --- STUB ---
     //
     //   struct perf_event_attr leader_attr{};
     //   leader_attr.type           = PERF_TYPE_HARDWARE;
@@ -52,29 +56,39 @@ std::optional<PerfGroup> PerfGroup::Open() noexcept {
     //                              | PERF_FORMAT_TOTAL_TIME_ENABLED
     //                              | PERF_FORMAT_TOTAL_TIME_RUNNING;
     //
-    //   int leader_fd = perf_event_open(&leader_attr,
-    //                                   /*pid=*/0, /*cpu=*/-1,
+    //   int leader_fd = perf_event_open(&leader_attr, pid, /*cpu=*/-1,
     //                                   /*group_fd=*/-1, /*flags=*/0);
     //   if (leader_fd < 0) return std::nullopt;
     //
-    //   struct perf_event_attr member_attr{};
-    //   member_attr.type     = PERF_TYPE_HARDWARE;
-    //   member_attr.config   = PERF_COUNT_HW_INSTRUCTIONS;
-    //   member_attr.size     = sizeof(member_attr);
-    //   member_attr.disabled = 1;
-    //   // read_format NOT set on members — only the leader is read.
+    //   struct perf_event_attr instr_attr{};
+    //   instr_attr.type     = PERF_TYPE_HARDWARE;
+    //   instr_attr.config   = PERF_COUNT_HW_INSTRUCTIONS;
+    //   instr_attr.size     = sizeof(instr_attr);
+    //   instr_attr.disabled = 1;
+    //   // Note: read_format NOT set on group members — only leader is read.
     //
-    //   int member_fd = perf_event_open(&member_attr,
-    //                                   /*pid=*/0, /*cpu=*/-1,
+    //   int member_fd = perf_event_open(&instr_attr, pid, /*cpu=*/-1,
     //                                   /*group_fd=*/leader_fd, /*flags=*/0);
-    //   if (member_fd < 0) { close(leader_fd); return std::nullopt; }
+    //   if (member_fd < 0) { ::close(leader_fd); return std::nullopt; }
     //
     //   PerfGroup g(leader_fd, member_fd);
     //   if (!g.Reset()) return std::nullopt;
     //   return g;
 
-    errno = ENOSYS;  // stub signal
+    (void)pid;
+    errno = ENOSYS;
     return std::nullopt;
+}
+
+// ---------------------------------------------------------------------------
+// Public factory methods
+// ---------------------------------------------------------------------------
+std::optional<PerfGroup> PerfGroup::Open() noexcept {
+    return OpenImpl(/*calling thread*/ 0);
+}
+
+std::optional<PerfGroup> PerfGroup::OpenForTid(pid_t tid) noexcept {
+    return OpenImpl(tid);
 }
 
 // ---------------------------------------------------------------------------
@@ -85,7 +99,7 @@ bool PerfGroup::Reset() noexcept {
     // TODO:
     //   ioctl(leader_fd_, PERF_EVENT_IOC_RESET,  PERF_IOC_FLAG_GROUP);
     //   ioctl(leader_fd_, PERF_EVENT_IOC_ENABLE, PERF_IOC_FLAG_GROUP);
-    return false;  // stub
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -95,9 +109,9 @@ bool PerfGroup::Read(PerfGroupReadFormat& out) const noexcept {
     if (leader_fd_ < 0) return false;
     // TODO:
     //   ssize_t n = ::read(leader_fd_, &out, sizeof(out));
-    //   return n == sizeof(out);
+    //   return n == static_cast<ssize_t>(sizeof(out));
     (void)out;
-    return false;  // stub
+    return false;
 }
 
 // ---------------------------------------------------------------------------
