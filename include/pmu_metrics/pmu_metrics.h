@@ -18,8 +18,9 @@
 #pragma once
 
 #include <cstdint>
-#include <optional>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace pmu_metrics {
 
@@ -60,24 +61,15 @@ struct InitConfig {
 };
 
 // ── Sample result ────────────────────────────────────────────────────────────
+//
+// A flat list of (counter_id, value) pairs — one entry per requested metric.
+// counter_id matches the Counter enum values (cast to int).
+// Only the metrics that were enabled in InitConfig are present.
+//
+// Example for Counter::IPC | Counter::CPI:
+//   { {1, 2}, {2, 0} }   →  IPC=2, CPI=0  (stub iteration 1)
 
-struct Sample {
-    // Monotonic wall-clock timestamp at the moment of sampling
-    // (CLOCK_MONOTONIC_RAW, nanoseconds).
-    uint64_t timestamp_ns = 0;
-
-    // Raw counter accumulations since the last sample() call (or Init()).
-    // Present only when the corresponding Counter bit was set in InitConfig.
-    // In the stub: incremented by a fixed delta each call so the host can
-    // verify the plumbing without real hardware counters.
-    std::optional<uint64_t> instructions;  // raw retired instructions
-    std::optional<uint64_t> cycles;        // raw CPU cycles
-
-    // Derived metrics.  Computed from instructions/cycles above.
-    // NaN (0.0) when the underlying counters are unavailable.
-    std::optional<double> ipc;  // instructions / cycles
-    std::optional<double> cpi;  // cycles / instructions
-};
+using Sample = std::vector<std::pair<int, int>>;
 
 // ── PmuMetricsManager ────────────────────────────────────────────────────────
 //
@@ -112,7 +104,8 @@ public:
     bool Init(const InitConfig& cfg = {});
 
     // Read counters, compute derived metrics, reset accumulators.
-    // Returns a zeroed Sample if Init() has not been called.
+    // Returns an empty vector if Init() has not been called.
+    // Each pair: { static_cast<int>(Counter::XXX), integer_value }.
     [[nodiscard]] Sample Sample();
 
     // True after a successful Init().
@@ -125,9 +118,8 @@ private:
     InitConfig cfg_{};
     bool       ready_{false};
 
-    // Stub state: monotonic counters incremented on each Sample() call.
-    uint64_t stub_instructions_{0};
-    uint64_t stub_cycles_{0};
+    // Stub state: call counter incremented on each Sample() call.
+    uint64_t stub_call_count_{0};
 };
 
 // ── Utility ──────────────────────────────────────────────────────────────────
