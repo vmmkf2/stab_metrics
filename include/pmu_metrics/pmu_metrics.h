@@ -1,16 +1,19 @@
-// pmu_metrics/pmu_metrics.h
-// Public API for the pmu_metrics static library.
+// pmu_metrics/include/pmu_metrics/pmu_metrics.h
 //
-// Design contract:
-//   - Raw perf_event_attr structs, file descriptors, and counter values are
-//     NEVER exposed through this header.
-//   - Perfetto DataSource registration happens automatically during static
-//     initialisation (before main()).  The host must NOT call
-//     perfetto::Tracing::Initialize(); that remains the host's responsibility.
-//   - Counter scope: thread-local  (pid = 0, cpu = -1).
-//   - Collection model: explicit host-driven Tick().  No background thread.
-//   - Target architecture: aarch64.  Initial metrics: IPC, CPI.
-//     (Expand with MPKI / Branch Miss Rate / TMA later.)
+// Minimal stub library for integrating PMU counter collection into the host
+// project and determining the right interface.
+//
+// Goals of this iteration:
+//   - Zero dependencies (no Perfetto, no pthreads, no linux/perf_event.h).
+//   - Caller decides which thread and CPU to measure — library is passive.
+//   - sample() returns a plain struct; no callbacks, no write-back.
+//   - Counter values are monotonic integers (stub implementation increments
+//     them by a fixed delta each call so the host can verify plumbing end-to-end).
+//
+// Non-goals of this iteration:
+//   - Real perf_event_open calls.
+//   - Perfetto integration.
+//   - Thread safety / concurrent sessions.
 
 #pragma once
 
@@ -20,103 +23,116 @@
 
 namespace pmu_metrics {
 
-// ---------------------------------------------------------------------------
-// MetricsSnapshot — aggregated, architecture-neutral metrics.
-// All raw counter values are hidden inside the library.
-// ---------------------------------------------------------------------------
-struct MetricsSnapshot {
-    // Cycles and instruction counts for the measured interval.
-    // Populated after every successful Tick().
-    uint64_t instructions{0};
-    uint64_t cycles{0};
-
-    // Derived metrics (NaN / 0 when counters are unavailable).
-    double ipc{0.0};   // Instructions Per Cycle
-    double cpi{0.0};   // Cycles Per Instruction
-
-    // Nanosecond wall-clock timestamp of this snapshot (CLOCK_MONOTONIC_RAW).
-    uint64_t timestamp_ns{0};
-
-    // True if the kernel multiplexed this group (scaled values are estimates).
-    bool scaled{false};
+// ── Counter selector ─────────────────────────────────────────────────────────
+//
+// Bitmask passed to PmuMetricsManager::Init() to choose which counters
+// the session should collect.  Combine with |.
+//
+enum class Counter : uint32_t {
+    IPC = 1 << 0,   // Instructions Per Cycle   (instructions / cycles)
+    CPI = 1 << 1,   // Cycles Per Instruction   (cycles / instructions)
+    // Reserved for future expansion:
+    // MPKI          = 1 << 2,
+    // BRANCH_MISS   = 1 << 3,
 };
 
-// ---------------------------------------------------------------------------
-// PmuConfig — passed once to PmuSession::Create().
-// ---------------------------------------------------------------------------
-struct PmuConfig {
-    // Name embedded in the Perfetto CounterTrack descriptor.
-    // Defaults to "pmu_metrics/<thread_id>" if left empty.
-    std::string_view track_name{};
+inline Counter operator|(Counter a, Counter b) {
+    return static_cast<Counter>(
+        static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
+}
+inline bool operator&(Counter a, Counter b) {
+    return (static_cast<uint32_t>(a) & static_cast<uint32_t>(b)) != 0;
+}
 
-    // Reserved for future expansion (MPKI, branch miss rate, TMA …).
-    // Ignored in the current stub.
-    bool enable_mpki{false};
-    bool enable_branch_miss_rate{false};
-    bool enable_tma_level1{false};  // aarch64: not yet implemented
+// ── Init config ──────────────────────────────────────────────────────────────
+
+struct InitConfig {
+    // Which derived metrics to collect.
+    Counter counters = Counter::IPC | Counter::CPI;
+
+    // Linux thread id to measure.
+    // 0 means "the calling thread" (resolved at Init() time via gettid()).
+    uint32_t tid = 0;
+
+    // CPU to pin measurement to.
+    // -1 means "any CPU the thread runs on" (follow the thread).
+    int cpu = -1;
 };
 
-// ---------------------------------------------------------------------------
-// PmuSession — opaque handle owning one set of perf fd groups for the
-// calling thread.  Non-copyable, non-movable.
+// ── Sample result ────────────────────────────────────────────────────────────
+
+struct Sample {
+    // Monotonic wall-clock timestamp at the moment of sampling
+    // (CLOCK_MONOTONIC_RAW, nanoseconds).
+    uint64_t timestamp_ns = 0;
+
+    // Raw counter accumulations since the last sample() call (or Init()).
+    // Present only when the corresponding Counter bit was set in InitConfig.
+    // In the stub: incremented by a fixed delta each call so the host can
+    // verify the plumbing without real hardware counters.
+    std::optional<uint64_t> instructions;  // raw retired instructions
+    std::optional<uint64_t> cycles;        // raw CPU cycles
+
+    // Derived metrics.  Computed from instructions/cycles above.
+    // NaN (0.0) when the underlying counters are unavailable.
+    std::optional<double> ipc;  // instructions / cycles
+    std::optional<double> cpi;  // cycles / instructions
+};
+
+// ── PmuMetricsManager ────────────────────────────────────────────────────────
 //
-// Typical host usage:
+// Owns one measurement session.  Non-copyable.
 //
-//   auto session = pmu_metrics::PmuSession::Create(config);
-//   if (!session) { /* perf_event_open unavailable */ }
+// Typical usage:
 //
-//   // … work …
-//   auto snap = session->Tick();     // read counters, emit Perfetto packet
-//   use(snap.ipc, snap.cpi);
+//   pmu_metrics::PmuMetricsManager mgr;
+//   mgr.Init({ .counters = pmu_metrics::Counter::IPC | pmu_metrics::Counter::CPI,
+//              .tid = gettid(),
+//              .cpu = -1 });
 //
-//   // session destructor closes fds and cleans up.
-// ---------------------------------------------------------------------------
-class PmuSession {
+//   // ... do work ...
+//
+//   auto s = mgr.Sample();
+//   printf("IPC=%.2f  CPI=%.2f\n", s.ipc.value_or(0), s.cpi.value_or(0));
+//
+class PmuMetricsManager {
 public:
-    // Factory.  Returns nullopt if perf_event_open fails (e.g. perf_event_paranoid
-    // too restrictive, or running on a non-aarch64 host in a future guard).
-    [[nodiscard]] static std::optional<PmuSession> Create(const PmuConfig& cfg = {});
+    PmuMetricsManager()  = default;
+    ~PmuMetricsManager() = default;
 
-    // Destructor closes all perf fds opened during Create().
-    ~PmuSession();
+    PmuMetricsManager(const PmuMetricsManager&)            = delete;
+    PmuMetricsManager& operator=(const PmuMetricsManager&) = delete;
 
-    // Non-copyable.
-    PmuSession(const PmuSession&)            = delete;
-    PmuSession& operator=(const PmuSession&) = delete;
+    PmuMetricsManager(PmuMetricsManager&&)            = default;
+    PmuMetricsManager& operator=(PmuMetricsManager&&) = default;
 
-    // Movable so optional<PmuSession> works.
-    PmuSession(PmuSession&&) noexcept;
-    PmuSession& operator=(PmuSession&&) noexcept;
+    // Configure and arm the session.
+    // May be called multiple times to reconfigure (implicitly resets counters).
+    // Returns false if the configuration is invalid.
+    bool Init(const InitConfig& cfg = {});
 
-    // Read counters for the interval since the last Tick() (or Create()),
-    // derive IPC/CPI, and emit one CounterTrack packet into the host's
-    // Perfetto trace buffer.
-    //
-    // Thread-safety: must be called from the same thread that called Create().
-    // Returns the aggregated snapshot so the host can act on it immediately.
-    [[nodiscard]] MetricsSnapshot Tick();
+    // Read counters, compute derived metrics, reset accumulators.
+    // Returns a zeroed Sample if Init() has not been called.
+    [[nodiscard]] Sample Sample();
 
-    // Returns the most recent snapshot without reading counters or emitting
-    // a Perfetto packet.  Useful for logging / assertions.
-    [[nodiscard]] const MetricsSnapshot& LastSnapshot() const noexcept;
+    // True after a successful Init().
+    bool IsReady() const noexcept { return ready_; }
+
+    // The config that was passed to the last successful Init().
+    const InitConfig& Config() const noexcept { return cfg_; }
 
 private:
-    // Pimpl to keep perf internals fully hidden from host TUs.
-    struct Impl;
-    Impl* impl_{nullptr};
+    InitConfig cfg_{};
+    bool       ready_{false};
 
-    explicit PmuSession(Impl* impl) noexcept;
+    // Stub state: monotonic counters incremented on each Sample() call.
+    uint64_t stub_instructions_{0};
+    uint64_t stub_cycles_{0};
 };
 
-// ---------------------------------------------------------------------------
-// Library-level helpers (no PmuSession needed).
-// ---------------------------------------------------------------------------
+// ── Utility ──────────────────────────────────────────────────────────────────
 
-// Returns true if perf_event_open is expected to succeed on this kernel
-// (checks /proc/sys/kernel/perf_event_paranoid).
-[[nodiscard]] bool IsPerfAvailable() noexcept;
-
-// Returns a string like "aarch64" or "x86_64" for the detected host CPU.
-[[nodiscard]] std::string_view HostArchitecture() noexcept;
+// Human-readable name for a Counter bit, e.g. "ipc".
+std::string_view CounterName(Counter c) noexcept;
 
 }  // namespace pmu_metrics

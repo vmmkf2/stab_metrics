@@ -1,129 +1,32 @@
 # pmu_metrics/BUILD.gn
 #
-# Produces libpmu_metrics.so — shipped to host projects in two variants
-# (base / proprietary).
-#
-# ── Key constraints ──────────────────────────────────────────────────────────
-#
-#  • ZERO Perfetto symbols in the .so.
-#    The .so is compiled with -fvisibility=hidden; only symbols annotated
-#    PMU_METRICS_API (visibility("default")) are exported.
-#    Perfetto lives entirely in the host binary.
-#
-#  • The host wires Perfetto to the library via writer callbacks at
-#    session-creation time.  See include/pmu_metrics/pmu_metrics_host_shim.h
-#    for the ready-made Perfetto DataSource + PmuMetricsShim C++ wrapper that
-#    the host compiles into its own binary.
-#
-# ── Host integration (summary) ───────────────────────────────────────────────
-#
-#  1. Add to target_server deps:
-#       "//third_party/pmu_metrics:pmu_metrics_shim"   # Perfetto DataSource
-#
-#  2. In exactly ONE host .cc:
-#       #define PMU_METRICS_DEFINE_DATA_SOURCE
-#       #include "pmu_metrics/pmu_metrics_host_shim.h"
-#
-#  3. At runtime, create sessions via PmuMetricsShim (C++) or
-#     pmu_metrics_create() directly (C).
-#
-# ── Perfetto SDK ─────────────────────────────────────────────────────────────
-#  The :pmu_metrics_shim source_set below depends on the Perfetto target.
-#  The .so itself does NOT.
+# Minimal stub build — no Perfetto dep, no linux/perf_event.h, no pthreads.
+# Goal: integrate into the host project and nail down the interface before
+# adding real hardware counter collection.
 
-import("pmu_metrics.gni")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Configs
-# ─────────────────────────────────────────────────────────────────────────────
-
-config("pmu_metrics_public_config") {
-  # Exposes include/ to any target that deps on :pmu_metrics or :pmu_metrics_headers.
+config("public_config") {
   include_dirs = [ "include" ]
 }
 
-config("pmu_metrics_private_config") {
-  include_dirs = [ "src" ]
+config("private_config") {
   cflags_cc = [
     "-std=c++17",
     "-Wall",
     "-Wextra",
-    "-Wpedantic",
     "-Wno-unused-parameter",
-    # Hide all symbols by default; only PMU_METRICS_API ones are exported.
     "-fvisibility=hidden",
     "-fvisibility-inlines-hidden",
   ]
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# :pmu_metrics_headers
-#
-# Header-only target — just exposes include/ with the C ABI header.
-# Useful for the host shim and for any TU that only needs the C types.
-# ─────────────────────────────────────────────────────────────────────────────
-source_set("pmu_metrics_headers") {
-  public = [
-    "include/pmu_metrics/pmu_metrics_c.h",
-  ]
-  public_configs = [ ":pmu_metrics_public_config" ]
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# :pmu_metrics  —  the shared library
-#
-# NO Perfetto dep here.  Only perf_event_open (kernel ABI) + C++ stdlib.
-# ─────────────────────────────────────────────────────────────────────────────
 shared_library("pmu_metrics") {
-  output_name = "pmu_metrics"   # → libpmu_metrics.so
+  output_name = "pmu_metrics"
 
-  sources = [
-    "src/perf_group.cc",
-    "src/perf_group.h",
-    "src/pmu_session.cc",
-  ]
+  sources = [ "src/pmu_metrics.cc" ]
+  public  = [ "include/pmu_metrics/pmu_metrics.h" ]
 
-  public = [ "include/pmu_metrics/pmu_metrics_c.h" ]
+  public_configs = [ ":public_config" ]
+  configs       += [ ":private_config" ]
 
-  public_configs  = [ ":pmu_metrics_public_config" ]
-  configs        += [ ":pmu_metrics_private_config" ]
-
-  # No Perfetto dep — intentional.
-  # perf_event_open is a raw syscall; no extra libs needed.
-  libs = []
-
-  # Export only the C ABI symbols; everything else is hidden.
-  # This is reinforced by -fvisibility=hidden in the private config above.
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# :pmu_metrics_shim
-#
-# Header-only source_set compiled into the HOST binary (not the .so).
-# Provides:
-#   - PmuMetricsDataSource  (Perfetto DataSource)
-#   - PmuMetricsShim        (C++ RAII wrapper around the C ABI)
-#   - Static-init DataSource registration (when PMU_METRICS_DEFINE_DATA_SOURCE
-#     is defined in exactly one host TU)
-#
-# The host's target_server target should dep on this, NOT on :pmu_metrics
-# directly (though it also needs :pmu_metrics linked at runtime).
-# ─────────────────────────────────────────────────────────────────────────────
-source_set("pmu_metrics_shim") {
-  public = [
-    "include/pmu_metrics/pmu_metrics_host_shim.h",
-  ]
-
-  public_configs = [ ":pmu_metrics_public_config" ]
-
-  public_deps = [
-    # Perfetto lives here — in the host, not in the .so.
-    pmu_metrics_perfetto_target,
-
-    # Needed for the C types referenced in the shim header.
-    ":pmu_metrics_headers",
-  ]
-
-  # The .so must be linked into the host binary at link time.
-  deps = [ ":pmu_metrics" ]
+  # No external deps in this iteration.
 }
